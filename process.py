@@ -29,23 +29,23 @@ def process_image(image_path):
     
     gray_img = np.array(gray_img) / 255.
     # Apply Laplacian of Gaussian edge detection
-    log_img = gaussian_laplace(gray_img, sigma=2)
+    log_img = gaussian_laplace(gray_img, sigma=2.5)
     
     # Threshold and normalize
-    threshold = 2e-3
+    threshold = 0
     log_img[log_img < threshold] = 0
     log_img = log_img / log_img.max()
     
     # Define Gaussian kernel size and standard deviation
-    sigma = 5  # Standard deviation for Gaussian kernel
+    sigma = 4  # Standard deviation for Gaussian kernel
     kernel_size = int(6*sigma + 1)  # Ensure kernel size covers enough area
     
     # Apply Gaussian filter to compute the neighborhood average
     neighborhood_avg = gaussian_filter(log_img, sigma=sigma, mode='constant')
     
     # Define epsilon to avoid division by zero
-    eps = 1e-3
-    saturation = 0.4
+    eps = 1e-1
+    saturation = 1
     
     # Apply Contrast Gain Control
     cgc_img = log_img / (neighborhood_avg + eps)
