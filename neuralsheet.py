@@ -29,6 +29,10 @@ class NeuralSheet(nn.Module):
         retinotopic_bias /= retinotopic_bias.max()
         self.retinotopic_bias = retinotopic_bias
         
+        lateral_bias = generate_gaussians(sheet_size, sheet_size, self.sheet_size/2).to(device)
+        lateral_bias /= lateral_bias.max()
+        self.lateral_bias = lateral_bias
+        
         # Afferent (receptive field) weights for each neuron in the sheet
         afferent_weights = torch.rand((sheet_size**2, 1, input_size, input_size), device=device)
         afferent_weights += retinotopic_bias
@@ -70,7 +74,7 @@ class NeuralSheet(nn.Module):
         self.bias_strength = 0.3
         
         self.afferent_unlearning = self.bias_strength
-        self.lateral_unlearning = 1e-2
+        self.lateral_unlearning = 0.23
         
         self.response_tracker = torch.zeros(self.iterations, 1, sheet_size, sheet_size, device=device)
         
@@ -84,16 +88,15 @@ class NeuralSheet(nn.Module):
         afferent = F.conv2d(input_crop, self.afferent_weights, padding='valid')
         self.current_afferent = afferent.view(self.current_response.shape)
 
-        long_range_inhibition = self.lateral_correlations #* self.masks
+        long_range_inhibition = self.lateral_correlations * self.masks
         long_range_inhibition /= long_range_inhibition.sum([2,3], keepdim=True) + 1e-11
     
-        self.lateral_unlearning = 1e-1
         self.iterations = 16
         for i in range(self.iterations):
             
-            self.eq = 0.3
+            self.eq = 0.4
             untuned_peak = 1
-            inversion = i < self.iterations//2
+            inversion = i < self.iterations//3
             
             self.t = self.eq * (1 - inversion)
             self.u = untuned_peak * inversion + (1 - self.eq)
@@ -109,7 +112,7 @@ class NeuralSheet(nn.Module):
             
             self.current_response = torch.tanh(F.relu(z))
             
-            self.lat_tracker[i] = self.current_response.clone()
+            self.response_tracker[i] = self.current_response.clone()
                         
                                     
         nonzero_act = self.current_response[self.current_response>0]
@@ -128,7 +131,7 @@ class NeuralSheet(nn.Module):
         self.afferent_weights = torch.relu(self.afferent_weights)
         self.afferent_weights /= self.afferent_weights.sum([2,3], keepdim=True) + 1e-11
         
-        lateral_contributions = self.current_response - self.lateral_unlearning
+        lateral_contributions = self.current_response + self.lateral_bias*self.bias_strength - self.lateral_unlearning
         delta_lateral = self.current_response.view(-1,1,1,1)*lateral_contributions
         self.lateral_correlations += hebbian_lr*delta_lateral
         self.lateral_correlations = torch.relu(self.lateral_correlations)
