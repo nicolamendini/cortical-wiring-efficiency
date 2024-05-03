@@ -14,6 +14,8 @@ import cv2
 import matplotlib.animation as animation
 from IPython.display import HTML
 
+import nn_template 
+
 class RandomCropDataset(Dataset):
     def __init__(self, directory, crop_size):
         self.directory = directory
@@ -60,6 +62,10 @@ def create_dataloader(root_dir, crop_size, batch_size, num_workers):
 def generate_gaussians(number_of_gaussians, size_of_gaussian, sigma):
     # Create a grid of coordinates (x, y) for the centers
     lin_centers = torch.linspace(-number_of_gaussians / 2, number_of_gaussians / 2, number_of_gaussians)
+
+    if number_of_gaussians==1:
+        lin_centers += 1/2
+        
     x_centers, y_centers = torch.meshgrid(lin_centers, lin_centers, indexing='ij')
     
     # Create a grid of coordinates (x, y) for a single Gaussian of size MxM
@@ -87,11 +93,39 @@ def generate_gaussians(number_of_gaussians, size_of_gaussian, sigma):
     
     return gaussians
 
+
+def generate_circles(number_of_circles, size_of_circles, radius=0):
+    # Create a grid of coordinates (x, y) for the centers
+    lin_centers = torch.linspace(-number_of_circles / 2, number_of_circles / 2, number_of_circles)
+
+    if number_of_circles==1:
+        lin_centers += 1/2
+        
+    x_centers, y_centers = torch.meshgrid(lin_centers, lin_centers, indexing='ij')
+    
+    # Create a grid of coordinates (x, y) for a single Gaussian of size MxM
+    lin_circle = torch.linspace(-size_of_circles / 2, size_of_circles / 2, size_of_circles)
+    x_circle, y_circle = torch.meshgrid(lin_circle, lin_circle, indexing='ij')
+    
+    # Flatten the center coordinates to easily use broadcasting
+    x_centers_flat = x_centers.reshape(-1, 1, 1)
+    y_centers_flat = y_centers.reshape(-1, 1, 1)
+    
+    # Calculate the squared distance for each Gaussian center to each point in the MxM grid
+    dist_squared = (x_circle - x_centers_flat) ** 2 + (y_circle - y_centers_flat) ** 2
+    
+    circles = dist_squared < ((radius + 1)**2)
+
+    circles = circles.reshape(number_of_circles**2, 1, size_of_circles, size_of_circles).float()
+    
+    return circles
+    
+
 def get_detectors(gabor_size, discreteness, device='cuda'):
     orientations = torch.linspace(0, np.pi, discreteness, device=device)
-    lambd = 6.0
+    lambd = 12.0
     sigma = 4.0
-    gamma = 0.8
+    gamma = 1
     psi = torch.tensor([0, np.pi/2], device=device)
 
     # Create a meshgrid for Gabor function
@@ -110,9 +144,12 @@ def get_detectors(gabor_size, discreteness, device='cuda'):
     
     return gb  # (discreteness, 2, gabor_size, gabor_size)
 
-def get_orientations(weights, discreteness=30, gabor_size=27):
+def get_orientations(weights, discreteness=30, gabor_size=21):
     
     device = weights.device
+
+    #weights = weights[:, 0] - weights[:, 1]
+    #weights = weights[:, None]
     
     # input is (M, 1, S, S)
     M, _, S, _ = weights.shape
@@ -124,7 +161,7 @@ def get_orientations(weights, discreteness=30, gabor_size=27):
     # Convolution over the receptive fields with each detector
     for i in range(discreteness):
         for j in range(2):
-            responses[:, i, j] = F.conv2d(weights, detectors[i:i+1, j].unsqueeze(1), padding='same').squeeze(1)
+            responses[:, i, j] = F.conv2d(weights, detectors[i:i+1, j].unsqueeze(1), padding='valid').squeeze(1)
             
             
     responses = responses.view(M, discreteness, 2, -1).max(3)[0]
@@ -142,98 +179,91 @@ def get_orientations(weights, discreteness=30, gabor_size=27):
     
     # output is M
     return orientation_map, phase_map
+    
 
+def get_grids(W, H, kernel_size, N, device='cuda'):
 
-def show_map(model, batch, random_sample=None):
+    # Generate grid positions for each patch using broadcasting
+    grid_positions_w = torch.linspace(0, W - kernel_size, N, device=device).view(-1, 1) / (W - 1) * 2 - 1
+    grid_positions_h = torch.linspace(0, H - kernel_size, N, device=device).view(1, -1) / (H - 1) * 2 - 1
     
-    plt.figure(figsize=(12, 18))
+    # Compute normalized coordinates for each patch
+    x = grid_positions_w + torch.linspace(0, kernel_size - 1, kernel_size, device=device).view(1, -1) / (W - 1) * 2
+    y = grid_positions_h + torch.linspace(0, kernel_size - 1, kernel_size, device=device).view(-1, 1) / (H - 1) * 2
     
-    if not random_sample:
-        random_sample = random.randint(0, model.afferent_weights.shape[0] - 1)
-        
-    random_batch = random.randint(0, batch.shape[0] - 1)
+    # Stack and reshape to create grid
+    grids_x, grids_y = torch.meshgrid(x.flatten(), y.flatten())
+    grids = torch.stack((grids_x, grids_y), dim=-1)
+    grids = grids.view(N, kernel_size, kernel_size, N,  2).permute(3,0,2,1,4).reshape(N*N, kernel_size, kernel_size, 2)
+
+    return grids
+
+def extract_patches(input_image, grids):
+    """
+    Extracts N patches of size kernel_size x kernel_size from input_image, calculating the step size automatically.
+    This function now handles cases where the last patch may not fit perfectly and returns patches with dimensions matching the input.
+    This version leverages CUDA for improved performance.
+    """
+    Nxx2 = grids.shape[0]
+    # Extract patches
+    patches = F.grid_sample(input_image.expand(Nxx2, -1, -1, -1), grids, mode='bilinear', align_corners=False)
     
-    model(batch[random_batch][None])
+    return patches
+
+def init_nn(input_size, output_size, device='cuda'):
+
+    network = {}
     
-    titles = [
-        "Current Input", "Afferent Weights", "Lateral Correlations",
-        "Lateral Weights Exc", "Current Response", "Current Response Histogram",
-        "Orientation Map", "Orientation Histogram", "Phase Map"
+    network['structure'] = [
+        ('flatten', 1, input_size**2),
+        ('dense', output_size**2, input_size**2),
+        ('dense', output_size**2, output_size**2),
+        ('dense', output_size**2, output_size**2),
+        ('unflatten', 1, output_size)
     ]
-
-    # Displaying the model's current input
-    plt.subplot(4, 3, 1)
-    plt.imshow(model.current_input[0, 0].detach().cpu())
-    plt.title(titles[0])
-
-    # Afferent weights of a random sample
-    plt.subplot(4, 3, 2)
-    plt.imshow(model.afferent_weights[random_sample, 0].detach().cpu())
-    plt.title(titles[1])
-
-    # Lateral correlations of the random sample
-    plt.subplot(4, 3, 3)
-    plotvar = model.lateral_correlations[random_sample, 0] * model.masks[random_sample, 0]
-    plotvar = plotvar*model.eq + model.untuned_inh[random_sample, 0]*(1-model.eq)
-    plt.imshow(plotvar.detach().cpu())
-    plt.title(titles[2])
-
-    # Lateral weights excitation of the random sample
-    plt.subplot(4, 3, 4)
-    plt.imshow(model.lateral_weights_exc[random_sample, 0].detach().cpu())
-    plt.title(titles[3])
-
-    # Model's current response
-    plt.subplot(4, 3, 5)
-    plt.imshow(model.current_response[0, 0].detach().cpu())
-    plt.title(titles[4])
-
-    # Histogram of the current response
-    plt.subplot(4, 3, 6)
-    hist = model.current_response.flatten().detach().cpu().numpy()
-    plt.hist(hist[hist > 0])
-    plt.title(titles[5])
-
-    # Generate and display orientation and phase maps
-    weights = model.afferent_weights.clone()
-    M = int(np.sqrt(model.afferent_weights.shape[0]))  # Assuming MxM grid for reshaping
-    ori_map, phase_map = get_orientations(weights)
-    ori_map = ori_map.reshape(M, M).cpu()
-    phase_map = phase_map.reshape(M, M).cpu()
     
-    # Orientation map
-    plt.subplot(4, 3, 7)
-    plt.imshow(ori_map, cmap='hsv')
-    plt.title(titles[6])
-
-    # Orientation histogram
-    plt.subplot(4, 3, 8)
-    plt.hist(ori_map.flatten())
-    plt.title(titles[7])
-
-    # Phase map
-    plt.subplot(4, 3, 9)
-    plt.imshow(phase_map, cmap='hsv')
-    plt.title(titles[8])
-
-    plt.show()
+    network['model'] = nn_template.Network(network['structure'], device=device)
+    params_list = [list(network['model'].layers[l].parameters()) for l in range(len(network['structure']))]
+    params_list = sum(params_list, [])
     
-# Function to animate an array as a useful visualisation
-def animate(array, n_frames, cmap=None, interval=300):
+    network['optim'] = torch.optim.Adam(params_list, lr=1e-3)
+    network['activ'] = torch.relu
     
-    fig = plt.figure(figsize=(6,6))
-    global i
-    i = -2
-    plt.subplots_adjust(top=1, bottom=0, right=1, left=0, hspace=0, wspace=0)
-    im = plt.imshow(array[0], animated=True, cmap=cmap)
+    return network
 
-    def updatefig(*args):
-        global i
-        if (i < n_frames - 1):  # ensure that we don't go out of bounds
-            i += 1
-        im.set_array(array[i])
-        return im,
+def nn_loss(network, true_input, reco_input, loss_weights):
 
-    anim = animation.FuncAnimation(fig, updatefig, frames=n_frames, interval=interval, repeat=True)
-    plt.close(fig)  # Prevents the static plot from showing in the notebook
-    return HTML(anim.to_jshtml())  # Directly display the animation
+    mse = ((true_input - reco_input)**2).sum([1,2,3]) * loss_weights
+    mse = mse.sum()
+    loss = mse 
+    return loss
+
+# Function to compute the Laplacian Of Gaussian Operator
+def get_log(size, std):
+    
+    distance = torch.arange(size) - size//2
+    x = distance.expand(1,1,size,size)**2
+    y = x.transpose(-1,-2)
+    t = (x + y) / (2*std**2)
+    LoG = -1/(np.pi*std**2) * (1-t) * torch.exp(-t)
+    LoG = LoG - LoG.mean()
+    return LoG
+
+def oddenise(number):
+    return round(number)+1 if round(number)%2==0 else round(number)
+
+
+def get_gaussian(size, std, yscale=1, centre_x=0, centre_y=0):
+    
+    distance = torch.arange(size) - size//2 - centre_x*(size//2)
+    x = distance.expand(1,1,size,size)**2
+    distance = torch.arange(size) - size//2 - centre_y*(size//2)
+    y = (distance.expand(1,1,size,size)**2).transpose(-1,-2)*yscale
+    t = (x + y) / (2*std**2)
+    gaussian = 1 / (np.sqrt(2*np.pi*std**2)) * torch.exp(-t)
+    gaussian /= gaussian.sum()
+        
+    return gaussian 
+
+    
+
