@@ -44,14 +44,16 @@ class NeuralSheet(nn.Module):
         lateral_weights_exc /= lateral_weights_exc.sum([2,3], keepdim=True)
         self.lateral_weights_exc = lateral_weights_exc
         
-        untuned_inh = generate_circles(sheet_size, sheet_size, max(std_exc*5,  3)).to(device)
+        untuned_inh = generate_gaussians(sheet_size, sheet_size, max(std_exc*3,  0.7)).to(device)
         untuned_inh /= untuned_inh.sum([2,3], keepdim=True)
         self.untuned_inh = untuned_inh 
 
         self.masks = \
             1 - untuned_inh/untuned_inh.view(untuned_inh.shape[0], -1).max(1)[0][:,None,None,None]
 
-        self.eye = 1 - generate_gaussians(self.sheet_size, self.sheet_size, 0.01).to(device)
+        #self.eye = 1 - generate_gaussians(self.sheet_size, self.sheet_size, 0.01).to(device)
+        self.eye = 1 - \
+            lateral_weights_exc/lateral_weights_exc.view(lateral_weights_exc.shape[0], -1).max(1)[0][:,None,None,None]
 
         log_std = 5
         log_size = oddenise(cutoff*log_std)
@@ -75,14 +77,15 @@ class NeuralSheet(nn.Module):
         
         self.current_response = torch.zeros(1, 1, sheet_size, sheet_size, device=device)
         
-        self.strength = 2
-        self.l4_strength = 2
-        self.aff_strength = 2
+        self.strength = 1
+        self.l4_strength = 1
+        self.aff_strength = 1
         
         self.iterations = 50
         self.response_tracker = torch.zeros(self.iterations, 1, sheet_size, sheet_size, device=device)
 
         self.avg_response = torch.zeros(1, 1, sheet_size, sheet_size, device=device)
+        self.avg_l4_res = torch.zeros(1, 1, sheet_size, sheet_size, device=device)
 
         self.homeo_lr = 1e-3
 
@@ -97,14 +100,17 @@ class NeuralSheet(nn.Module):
         self.aff_range = 0.5
         self.res_range = 0.5
         self.l4_range = 0.5
+        
+        self.avg_l4_hist = torch.zeros(10) 
     
     def forward(self, input_crop, rf_grids):
 
-        self.beta_response = 0.9
-        self.homeo_target = 0.04
+        self.aff_b = 0.9
+        self.beta_response = 0.
+        self.homeo_target = 0.075
         self.aff_unlearning = 0
         self.lat_unlearning = self.aff_unlearning
-        self.iterations = 50
+        self.iterations = 30
         #self.response_tracker = torch.zeros(self.iterations, 1, self.sheet_size, self.sheet_size).cuda()
         
         self.current_input = input_crop
@@ -119,9 +125,11 @@ class NeuralSheet(nn.Module):
         afferent = afferent.sum([2,3])
         self.current_afferent = afferent.sum(1).view(self.current_response.shape)
 
-        #untuned_inh = generate_circles(self.sheet_size, self.sheet_size, max(5*0.7, 1)).to('cuda')
+        #untuned_inh = generate_gaussians(self.sheet_size, self.sheet_size, max(5*0.1, 1)).to('cuda')
         #untuned_inh /= untuned_inh.sum([2,3], keepdim=True)
         #self.untuned_inh = untuned_inh
+        #self.masks = \
+        #    1 - untuned_inh/untuned_inh.view(untuned_inh.shape[0], -1).max(1)[0][:,None,None,None]
 
         #contrast = F.conv2d(input_crop, self.contrast_log, padding='same')
         #contrast = F.interpolate(contrast, self.sheet_size, mode='bilinear')
@@ -139,40 +147,68 @@ class NeuralSheet(nn.Module):
                         
         for i in range(self.iterations):
             
-            b = self.aff_range / (self.res_range + 1e-11)
+            imp_start = 1
+            imp_mid = 1.
+            imp_end = 1.
+            
+            idx_start = 10
+            imp_dec = 0.95
+            
+            if i<idx_start:
+                self.si = imp_start
+                
+            elif i==idx_start:
+                self.si = imp_mid
+                
+            else:
+                self.si = self.si*imp_dec if self.si*imp_dec>imp_end else imp_end            
+            
+            b = self.aff_range / (self.res_range + 1e-11)                 
+            self.l4_afferent = self.current_afferent * self.aff_b + self.current_response * b * (1-self.aff_b)
                         
-            self.l4_afferent = self.current_afferent * 0.5 + self.current_response * b * 0.5
-                        
-            mid_range_inhibition = self.l4_correlations * (1 - self.masks)
+            mid_range_inhibition = self.l4_correlations * (1 - self.masks) * self.eye
             mid_range_inhibition /= mid_range_inhibition.sum([1,2,3], keepdim=True) + 1e-11
+            self.mid_range_inhibition = mid_range_inhibition
             
             l4_lateral_weights = self.lateral_weights_exc - mid_range_inhibition
             l4_lateral = F.conv2d(self.l4_response, l4_lateral_weights, padding='valid')
             l4_lateral = l4_lateral.view(self.l4_response.shape)
-            
-            l4_response = torch.relu(self.l4_afferent + l4_lateral - self.l4_thresholds) 
-            self.l4_response = torch.tanh(l4_response * self.l4_strength)
+                        
+            self.l4_response = torch.relu(self.l4_afferent + l4_lateral - self.l4_thresholds) * self.l4_strength
+            #self.l4_response = self.l4_response / divisive_inh * self.l4_strength
+            #self.l4_response = torch.minimum(self.l4_response, torch.tensor(1))
+            self.l4_response = torch.tanh(self.l4_response)
             
             excitation = torch.relu(self.lateral_correlations - 1.5/self.sheet_size**2) 
             excitation /= excitation.sum([1,2,3], keepdim=True) + 1e-11
-            lateral_exc = F.conv2d(self.current_response, excitation, padding='valid')
-            self.excitation = lateral_exc.view(self.current_response.shape)
+            self.excitation = excitation
             
             pad = self.lri_smoother.shape[-1]//2
-            inhibition = torch.relu(self.lateral_correlations - 1./self.sheet_size**2) 
+            inhibition = torch.relu(self.lateral_correlations - 1.5/self.sheet_size**2) 
             inhibition /= inhibition.sum([1,2,3], keepdim=True) + 1e-11
-            inhibition = F.conv2d(self.current_response, inhibition, padding='valid')
+            self.inhibition = inhibition
             
-            self.inhibition = inhibition.view(self.current_response.shape)
-            lateral = self.excitation - self.inhibition
+            long_interaction = self.excitation - torch.exp(self.inhibition) + 1
+            
+            lateral = F.conv2d(self.current_response, long_interaction, padding='valid')
             lateral = lateral.view(self.current_response.shape) 
-                                    
+            
+            divisive_inh = F.conv2d(self.current_response, self.inhibition, padding='valid')
+            divisive_inh = divisive_inh.view(self.current_response.shape) 
+            divisive_inh = divisive_inh*3 + 1
+            
+            #divisive_inh[divisive_inh<1] = 1
+            #b = self.aff_range / (self.l4_range + 1e-11)
+                                                                                    
             # Initial activation
-            z = torch.relu(self.l4_response + lateral - self.thresholds)
+            z = torch.relu(self.l4_response + lateral - self.thresholds) * self.strength
+            #self.current_response = z / divisive_inh * self.strength
+            #self.current_response = torch.minimum(self.current_response, torch.tensor(1))
+            self.current_response = torch.tanh(self.current_response)
+            #self.current_response = self.l4_response
 
-            self.current_response = torch.tanh(z)
-
-            self.avg_response = self.beta_response*self.avg_response + (1-self.beta_response)*self.l4_response
+            self.avg_response = self.beta_response*self.avg_response + (1-self.beta_response)*self.current_response
+            self.avg_l4_res = self.beta_response*self.avg_l4_res + (1-self.beta_response)*self.l4_response
             
             self.response_tracker[i] = self.current_response.clone()
                         
@@ -182,20 +218,22 @@ class NeuralSheet(nn.Module):
         fast_lr = self.homeo_lr * 10
         if nonzero_act.shape[0] > 1e1 and l4_nonzero.shape[0] > 1e1:
             self.strength -= (nonzero_act.mean() - 0.5) * fast_lr
-            self.l4_strength -= (l4_nonzero.mean() - 0.5) * fast_lr
+            self.l4_strength -= (l4_nonzero.mean() - 0.3) * fast_lr
             aff_range = self.current_afferent.max() - self.current_afferent.min()
             self.aff_range = self.aff_range * (1 - fast_lr) + aff_range * fast_lr
             res_range = self.current_response.max() - self.current_response.min()
             self.res_range = self.res_range * (1 - fast_lr) + res_range * fast_lr
+            l4_range = self.l4_response.max() - self.l4_response.min()
+            self.l4_range = self.l4_range * (1 - fast_lr) + l4_range * fast_lr
+            
+            new_hist = np.histogram(self.l4_response.cpu(), bins=10, range=(0,1))[0]
+            self.avg_l4_hist = self.avg_l4_hist*(1-fast_lr) + new_hist*fast_lr
             
         self.l4_mean_activations = self.l4_mean_activations * (1 - self.homeo_lr) + self.l4_response * self.homeo_lr
         self.l4_thresholds -= (self.homeo_target - self.l4_mean_activations) / self.homeo_target * self.homeo_lr
             
         self.mean_activations = self.mean_activations * (1 - self.homeo_lr) + self.current_response * self.homeo_lr
         self.thresholds -= (self.homeo_target - self.mean_activations) / self.homeo_target * self.homeo_lr
-
-        
-            
             
     def hebbian_step(self):
 
@@ -205,8 +243,7 @@ class NeuralSheet(nn.Module):
         lateral_contributions = self.avg_response - self.lat_unlearning 
         self.step(self.lateral_correlations, lateral_contributions, self.current_response)
         
-        l4_contributions = self.l4_response - self.lat_unlearning 
-        self.lateral_target = l4_contributions
+        l4_contributions = self.avg_l4_res - self.lat_unlearning 
         self.step(self.l4_correlations, l4_contributions, self.l4_response)
         
 

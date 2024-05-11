@@ -217,8 +217,8 @@ def init_nn(input_size, output_size, device='cuda'):
     network['structure'] = [
         ('flatten', 1, input_size**2),
         ('dense', output_size**2, input_size**2),
-        ('dense', output_size**2, output_size**2),
-        ('dense', output_size**2, output_size**2),
+        #('dense', output_size**2, output_size**2),
+        #('dense', output_size**2, output_size**2),
         ('unflatten', 1, output_size)
     ]
     
@@ -235,7 +235,14 @@ def nn_loss(network, true_input, reco_input, loss_weights):
 
     mse = ((true_input - reco_input)**2).sum([1,2,3]) * loss_weights
     mse = mse.sum()
-    loss = mse 
+    l1 = sum(
+        [
+            list(network['model'].layers[l].parameters())[0].abs().sum() \
+            for l in range(1,len(network['structure'])-1)
+        ]
+    )
+    l1 = l1.sum()
+    loss = mse + 0*l1
     return loss
 
 # Function to compute the Laplacian Of Gaussian Operator

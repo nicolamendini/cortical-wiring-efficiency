@@ -93,13 +93,14 @@ def show_map(model, network, random_sample=None):
     titles = [
         "Current Input", "Afferent Weights", "Current Aff Response", "Exc - inh",
         "Lateral correlations", "Current Response", "Current Response Histogram",
-        "Orientation Map", "Orientation Histogram", "Phase Map", "L4 afferent", "Map detector Gabor",
-        "Reconstruction", "Positive Afferent", "Thresholds", "L4 response"
+        "Orientation Map", "Orientation Histogram", "Phase Map", "L4 Afferent", "L4 Histogram",
+        "Reconstruction", "Positive Afferent", "Thresholds", "L4 Response"
     ]
 
     # Displaying the model's current input
     img = model.current_input[0, 0].detach().cpu()
-    img[0,0] = 1
+    c = model.rf_size // 2
+    img = img[c:-c,c:-c]
     plt.subplot(4, 4, 1)
     plt.imshow(img)
     plt.title(titles[0])
@@ -107,7 +108,7 @@ def show_map(model, network, random_sample=None):
     # Afferent weights of a random sample
     aff_weights = model.afferent_weights[random_sample, 0] #- model.afferent_weights[random_sample, 1]
     aff_weights[0,0] = 0
-    plt.subplot(4, 4, 2)
+    plt.subplot(4, 4, 13)
     plt.imshow(aff_weights.detach().cpu())
     plt.title(titles[1])
 
@@ -121,14 +122,14 @@ def show_map(model, network, random_sample=None):
 
     # Lateral correlations of the random sample
     plt.subplot(4, 4, 4)
-    plotvar = - model.inhibition[0, 0] + model.excitation[0,0]
+    plotvar = model.mid_range_inhibition[random_sample, 0] * model.eye[random_sample, 0]
     plotvar[0,0] = 0
     plt.imshow(plotvar.detach().cpu())
     plt.title(titles[3])
 
     # Lateral weights excitation of the random sample
     plt.subplot(4, 4, 5)
-    plotvar = torch.relu(model.lateral_correlations[random_sample, 0] - 1.5/model.sheet_size**2)
+    plotvar = torch.relu(model.lateral_correlations[random_sample, 0] - 2/model.sheet_size**2)
     plt.imshow(plotvar.detach().cpu())
     plt.title(titles[4])
 
@@ -140,7 +141,7 @@ def show_map(model, network, random_sample=None):
     # Histogram of the current response
     plt.subplot(4, 4, 7)
     hist = model.current_response.flatten().detach().cpu().numpy()
-    plt.hist(hist[hist > 0])
+    plt.hist(hist[hist > 0.1])
     plt.title(titles[6])
 
     # Generate and display orientation and phase maps
@@ -162,7 +163,8 @@ def show_map(model, network, random_sample=None):
 
     # Phase map
     plt.subplot(4, 4, 10)
-    plt.imshow(phase_map, cmap='hsv')
+    hist = model.l4_response.cpu().flatten()
+    plt.hist(hist[hist>0])
     plt.title(titles[9])
 
     # Retinotopic Bias
@@ -172,15 +174,13 @@ def show_map(model, network, random_sample=None):
     plt.imshow(l4_afferent)
     plt.title(titles[10])
 
-    gabors = get_detectors(model.rf_size, 2, device='cuda')
-    # Gabor detectors
     plt.subplot(4, 4, 12)
-    plt.imshow(gabors[0,0].cpu())
+    plt.stairs(model.avg_l4_hist.int()[1:], torch.linspace(0.1,1,10), fill=True)
     plt.title(titles[11])
 
     reco_input = network['activ'](network['model'](model.current_response))[0,0].detach().cpu()
     # nn reconstruction
-    plt.subplot(4, 4, 13)
+    plt.subplot(4, 4, 2)
     plt.imshow(reco_input)
     plt.title(titles[12])
 

@@ -53,10 +53,10 @@ class Network(nn.Module):
             
             if debug:
                 print(i, act.shape)
-            
-            act = torch.relu(act)
 
             act = self.layers[i](act)
+            
+            act = torch.tanh(act)
 
         return act
 
