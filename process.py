@@ -7,6 +7,32 @@ from tqdm import tqdm
 from scipy.ndimage import gaussian_laplace, gaussian_filter
 from skimage.color import rgb2gray
 import matplotlib.pyplot as plt
+import torch
+import torch.nn.functional as F
+
+def get_detectors(gabor_size, discreteness=4, device='cpu'):
+
+    orientations = torch.linspace(0, np.pi*(discreteness-1)/discreteness, discreteness, device=device)
+    lambd = 10.0
+    sigma = 2.5
+    gamma = 1
+
+    # Create a meshgrid for Gabor function
+    x, y = torch.meshgrid(
+    	torch.linspace(-gabor_size//2, gabor_size//2, gabor_size, device=device), 
+        torch.linspace(-gabor_size//2, gabor_size//2, gabor_size, device=device), 
+        indexing='ij'
+        )
+
+    orientations = orientations.view(discreteness, 1, 1, 1)
+
+    x_theta = x * torch.cos(orientations) + y * torch.sin(orientations)
+    y_theta = -x * torch.sin(orientations) + y * torch.cos(orientations)
+    
+    gb = torch.exp(-.5 * (x_theta**2 + gamma**2 * y_theta**2) / sigma**2) \
+    	* torch.cos(2 * np.pi * x_theta / lambd)
+    
+    return gb - gb.mean([2,3],keepdim=True) # (discreteness, 1, gabor_size, gabor_size)
 
 def process_image(image_path):
 
@@ -22,8 +48,13 @@ def process_image(image_path):
     gray_img = np.array(gray_img, dtype=float)
     
     # Apply Laplacian of Gaussian edge detection
-    log_img = gaussian_laplace(gray_img, sigma=1.2)
+    log_img = gaussian_laplace(gray_img, sigma=1.5)
     inv_log_img = -log_img  # Inverse polarity for the OFF channel
+    
+    #threshold = 0
+    #log_img[log_img < threshold] = 0
+    #log_img= torch.tensor(log_img[None,None], dtype=torch.float)
+    #log_img = F.conv2d(log_img, gabors, padding=gabors.shape[-1]//2)
     
     # Normalize the ON and OFF channels
     on_channel = normalize_channel(log_img)   
@@ -39,24 +70,23 @@ def process_image(image_path):
     
 # Normalize each channel
 def normalize_channel(channel):
-	threshold = 1e-4
+	threshold = 0
 	channel[channel < threshold] = 0
-	channel = channel / np.max(channel) if np.max(channel) != 0 else channel
 
 	# Gaussian filter parameters
 	sigma = 4
-	kernel_size = int(6 * sigma + 1)
 
 	# Local normalization
 	neighborhood_avg = gaussian_filter(channel, sigma=sigma, mode='constant')
 	eps = 3e-3
-	saturation = 0.45
+	saturation = 0.5
 	cgc_img = np.tanh((channel / (neighborhood_avg + eps)) * saturation)
 
 	# Convert to 8-bit
 	return img_as_ubyte(cgc_img)
 
 def process_images_in_folder(root_folder, output_folder):
+	
     # Get all image paths first to calculate progress
     image_paths = []
     for subdir, dirs, files in os.walk(root_folder):
@@ -82,7 +112,11 @@ def process_images_in_folder(root_folder, output_folder):
 # Example usage
 root_folder = './imagenet-mini'  # Change this to your folder path
 output_folder = './input_stimuli'  # Change this to your desired output folder path
+# Get the gabor detectors
+gabors = get_detectors(17)
 process_images_in_folder(root_folder, output_folder)
-
+plt.imshow(gabors[0,0])
+plt.show()
+print(gabors.sum())
 
 

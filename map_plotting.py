@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import cv2
 import matplotlib.animation as animation
 from IPython.display import HTML
+from scipy.optimize import curve_fit
 
 from wiring_efficiency_utils import *
 
@@ -91,7 +92,7 @@ def show_map(model, network, random_sample=None):
 
     plt.figure(figsize=(12, 14))
     titles = [
-        "Current Input", "Afferent Weights", "Current Aff Response", "Exc - inh",
+        "Current Input", "Afferent Weights", "Current Aff Response", "Inhibitory weights",
         "Lateral correlations", "Current Response", "Current Response Histogram",
         "Orientation Map", "Orientation Histogram", "Phase Map", "L4 Afferent", "L4 Histogram",
         "Reconstruction", "Positive Afferent", "Thresholds", "L4 Response"
@@ -122,14 +123,15 @@ def show_map(model, network, random_sample=None):
 
     # Lateral correlations of the random sample
     plt.subplot(4, 4, 4)
-    plotvar = model.mid_range_inhibition[random_sample, 0] * model.eye[random_sample, 0]
+    #plotvar = model.long_interactions[random_sample, 0]#* model.eye[random_sample, 0]
+    plotvar = model.mid_range_inhibition[random_sample, 0]
     plotvar[0,0] = 0
     plt.imshow(plotvar.detach().cpu())
     plt.title(titles[3])
 
     # Lateral weights excitation of the random sample
     plt.subplot(4, 4, 5)
-    plotvar = torch.relu(model.lateral_correlations[random_sample, 0] - 2/model.sheet_size**2)
+    plotvar = torch.relu(model.l4_correlations[random_sample, 0] - 1.5/model.sheet_size**2)
     plt.imshow(plotvar.detach().cpu())
     plt.title(titles[4])
 
@@ -147,7 +149,7 @@ def show_map(model, network, random_sample=None):
     # Generate and display orientation and phase maps
     weights = model.afferent_weights.clone()
     M = int(np.sqrt(model.afferent_weights.shape[0]))  # Assuming MxM grid for reshaping
-    ori_map, phase_map = get_orientations(weights, gabor_size=model.rf_size)
+    ori_map, phase_map, mean_tc = get_orientations(weights, gabor_size=model.rf_size)
     ori_map = ori_map.reshape(M, M).cpu()
     phase_map = phase_map.reshape(M, M).cpu()
     
@@ -163,8 +165,7 @@ def show_map(model, network, random_sample=None):
 
     # Phase map
     plt.subplot(4, 4, 10)
-    hist = model.l4_response.cpu().flatten()
-    plt.hist(hist[hist>0])
+    plt.plot(mean_tc)
     plt.title(titles[9])
 
     # Retinotopic Bias
@@ -185,14 +186,12 @@ def show_map(model, network, random_sample=None):
     plt.title(titles[12])
 
     # afferent with thresholds
-    curr_net_afferent = torch.relu(net_afferent)
-    curr_net_afferent[0,0] = 0
     plt.subplot(4, 4, 14)
-    plt.imshow(curr_net_afferent.cpu())
+    plt.imshow(torch.relu(model.current_afferent- model.l4_thresholds)[0,0].cpu())
     plt.title(titles[13])
 
     # thresholds
-    thresholds = model.thresholds[0,0]
+    thresholds = model.l4_thresholds[0,0]
     #thresholds[0,0] = 1
     plt.subplot(4, 4, 15)
     plt.imshow(thresholds.cpu())
@@ -211,6 +210,272 @@ def show_map(model, network, random_sample=None):
     print('Mean pos afferent Mean: {:.3f} and aff strength {:.3f}'.format(model.mean_pos_afferent.mean(), model.aff_strength))
     print('Mean current response: {:.3f}'.format(model.current_response.mean()))
     print('L4 Strength: {:.3f} strength: {:.3f} aff strength: {:.3f}'.format(model.l4_strength, model.strength, model.aff_strength))
+    loss = torch.mean((reco_input - img)**2) * 100
+    print('Reco loss: {:.3f}%'.format(loss))
 
 
     plt.show()
+    
+    
+def make_compx_plots(data):
+    sizesvar = data['sizesvar']
+    trialvar = data['trialvar']
+    
+    # ----------------------- tuning curves
+    tuning_curves = data['tc_tracker']
+    tuning_curves -= tuning_curves.min(2, keepdim=True)[0]
+    tuning_curves /= tuning_curves.max()
+    
+    orientations = np.linspace(0, np.pi, 5)
+    
+    fontsize = 14
+    ticksize = 12
+    
+    for s in range(len(sizesvar)):
+        
+        plt.figure()
+        
+        plt.xlabel('Orientation (rad)', fontsize=fontsize)
+        plt.ylabel('Response (a.u.)', fontsize=fontsize)
+        
+        plt.xticks(orientations, labels=['0','π/4','π/2','3/4π','π'], fontsize=ticksize)
+        plt.ylim(0, 1.05)
+        plt.yticks([0, 0.5, 1], fontsize=ticksize)
+                
+        for i in range(len(trialvar)//2):
+            
+            curve_data = (tuning_curves[s, i*2])**2
+            x = np.linspace(0, np.pi, tuning_curves.shape[-1])
+            plt.plot(x, curve_data)
+        
+        plt.savefig(f'./fig1/tc{s}.svg')
+        plt.close() 
+        
+        
+    # ----------------------- accuracy curves
+    accuracy = data['reco_tracker'][:,:,-100:].mean(2)
+    peaks = data['peak_tracker']
+    
+    plt.xlabel('Range of lateral excitation (σ)', fontsize=fontsize)
+    plt.ylabel('Accuracy', fontsize=fontsize)
+
+    plt.xticks(fontsize=ticksize)
+    plt.ylim(0, 0.55)
+    plt.yticks(fontsize=ticksize)
+    
+    def exp_func(x, a, b):
+        return a*np.exp(x*b) + 5e-2
+
+    for s in range(len(sizesvar)):
+
+        popt, pcov = curve_fit(exp_func,  trialvar**2, accuracy[s])
+        plt.scatter(trialvar**2, accuracy[s])
+        y_fit = exp_func(trialvar**2, popt[0], popt[1])
+        plt.plot(trialvar**2, y_fit, label='N='+str(sizesvar[s]**2))
+        
+    plt.plot(trialvar**2, [.35]*len(trialvar), linestyle='--', color='grey')
+    plt.plot(trialvar**2, [.25]*len(trialvar), linestyle='--', color='grey')
+
+    plt.legend(fontsize=ticksize)
+    plt.savefig('./fig1/accuracy.svg')
+    plt.close() 
+    
+    # ----------------------- complexity curves
+    for c in range(2):
+        
+        complexity = data['se_tracker']
+        label = 'Fourier'
+        baseline = 443
+        if c==1:
+            complexity =data['se_pca_tracker']
+            label = 'PCA'
+            baseline = 810
+
+        plt.ticklabel_format(axis='y', style='sci', scilimits=(2,2))
+        plt.xlabel('Range of lateral excitation (σ)', fontsize=fontsize)
+        plt.ylabel(f'Effective dimensions ({label})', fontsize=fontsize)
+
+        plt.xticks(fontsize=ticksize)
+        plt.yticks(fontsize=ticksize)
+
+        def exp_func(x, a, b, c):
+            return 1e2*a*(np.exp(-x*b)+c)
+
+        for s in range(len(sizesvar)):
+            
+            popt, pcov = curve_fit(exp_func,  trialvar**2, complexity[s])
+            plt.scatter(trialvar**2, complexity[s])
+            y_fit = exp_func(trialvar**2, popt[0], popt[1], popt[2])
+            plt.plot(trialvar**2, y_fit, label='N='+str(sizesvar[s]**2))
+
+        plt.plot(trialvar**2, [baseline]*len(trialvar), linestyle='--', color='grey')
+
+        plt.legend(fontsize=ticksize)
+        plt.savefig(f'./fig1/complexity_{label}.svg')
+        plt.close() 
+        
+    
+    # ----------------------- accuracy pinwheels
+    n_pinwheels = np.array(sizesvar)[None]**2 * np.array(peaks - 4e-2).T**2
+
+    fig = plt.figure()
+    ax = plt.gca()
+    
+    plt.xlabel('Number of pinwheels', fontsize=fontsize)
+    plt.ylabel('Accuracy', fontsize=fontsize)
+
+    plt.xticks(fontsize=ticksize)
+    plt.yticks(fontsize=ticksize)
+
+    for s in range(len(sizesvar)):
+        ax.scatter(n_pinwheels[2:,s], accuracy.T[2:,s], label='N='+str(sizesvar[s]**2))
+        
+    def tanh_func(x, a, b, c):
+        return a*np.tanh(x*b) + c*0.1
+    
+    x = n_pinwheels[2:].flatten()
+    y = accuracy.T[2:].flatten()
+    
+    popt, pcov = curve_fit(tanh_func,  x, y)
+    
+    x = np.arange(n_pinwheels.max()/2)
+    plt.plot(x, tanh_func(x, popt[0], popt[1], popt[2]), color='black', linewidth=0.5)
+    
+    plt.legend(loc='center right')
+    plt.savefig(f'./fig1/accuracy_pw.svg')
+    plt.close()
+    
+    # ----------------------- tuning curves pw
+    
+    max_pw = 45
+    fig = plt.figure()
+    ax = plt.gca()
+    
+    plt.xlabel('Number of pinwheels', fontsize=fontsize)
+    plt.ylabel('Receptive field sharpness', fontsize=fontsize)
+
+    plt.xticks(fontsize=ticksize)
+    plt.yticks(fontsize=ticksize)
+    
+    tuning_curves = tuning_curves.max(2)[0]
+    X = []
+    Y = []
+
+    for s in range(len(sizesvar)):
+        x = n_pinwheels[2:,s]
+        y = tuning_curves.T[2:,s]
+        y = y[x<max_pw]
+        x = x[x<max_pw]
+        X.append(list(x))
+        Y.append(list(y))
+        ax.scatter(x, y, label='N='+str(sizesvar[s]**2))
+        
+    def linear_func(x, m, b):
+        return m*x + 0.1
+    
+    X = [x for xs in X for x in xs]
+    Y = [x for xs in Y for x in xs]
+        
+    popt, pcov = curve_fit(linear_func, X, Y)
+    
+    x = np.array([0, max_pw])
+    plt.plot(x, linear_func(x, popt[0], popt[1]), color='black', linewidth=0.5)
+    
+    plt.legend()
+    plt.savefig(f'./fig1/tuning_pw.svg')
+    plt.close()
+    
+    # ----------------------- complexity pinwheels
+    for c in range(2):
+        fig = plt.figure()
+        ax = plt.gca()
+        complexity = data['se_tracker']
+        label = 'Fourier'
+        baseline = 443
+        if c==1:
+            complexity =data['se_pca_tracker']
+            label = 'PCA'
+            baseline = 810
+
+        plt.xlabel('Number of pinwheels', fontsize=fontsize)
+        plt.ylabel(f'Effective dimensions ({label})', fontsize=fontsize)
+
+        plt.xticks(fontsize=ticksize)
+        plt.yticks(fontsize=ticksize)
+
+        for s in range(len(sizesvar)):
+            ax.scatter(n_pinwheels[2:,s], complexity.T[2:,s], label='N='+str(sizesvar[s]**2))
+
+        def linear_func(x, m, b):
+            return m*x + b
+
+        x = n_pinwheels[2:].flatten()
+        y = complexity.T[2:].flatten()
+
+        popt, pcov = curve_fit(linear_func, x, y)
+
+        x = np.arange(n_pinwheels.max()/2)
+        plt.plot(x, linear_func(x, popt[0], popt[1]), color='black', linewidth=0.5)
+        
+        plt.plot([0,n_pinwheels.max()/2], [baseline]*2, linestyle='--', color='grey')
+
+        plt.legend()
+        plt.savefig(f'./fig1/complexity_pw_{label}.svg')
+        plt.close()
+        
+    # ----------------------- lambda
+    fig = plt.figure()
+    ax = plt.gca()
+    
+    plt.xlabel('Range of lateral excitation (σ)', fontsize=fontsize)
+    plt.ylabel('Average domain spacing (Λ)', fontsize=fontsize)
+
+    plt.xticks(fontsize=ticksize)
+    plt.yticks(fontsize=ticksize)
+
+    for s in range(len(sizesvar)):
+        ax.scatter(trialvar, 1/peaks[s], label='N='+str(sizesvar[s]**2))
+
+    def linear_func(x, m, b):
+        return m*x + b
+
+    x = trialvar[None].repeat(len(sizesvar), axis=0).flatten()
+    y = 1/peaks.flatten()
+
+    popt, pcov = curve_fit(linear_func, x, y)
+
+    plt.plot(trialvar, linear_func(trialvar, popt[0], popt[1]), color='black', linewidth=0.5)
+
+    plt.legend()
+    plt.savefig('./fig1/lambda.svg')
+    plt.close()
+    
+    # ----------------------- dimensions
+    
+    for c in range(2):
+        fig = plt.figure()
+        ax = plt.gca()
+        components = data['spectrum_tracker']
+        label = 'Fourier'
+        if c==1:
+            components = data['comp_tracker']
+            label = 'PCA'
+            
+        samples = 3
+        size = 2
+        step = len(trialvar) // samples
+        
+        a = 1
+        if c:
+            a = 4
+        
+
+        for s in range(samples):
+
+            plt.subplot(1,samples,s+1)
+            plt.axis('off')
+            plt.imshow(components[size, s*step, :sizesvar[size]*a, :sizesvar[size]*a])
+
+        plt.savefig(f'./fig1/components_{(label)}.svg')
+        #plt.close()
+    

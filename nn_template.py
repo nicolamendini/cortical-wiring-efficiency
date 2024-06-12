@@ -42,7 +42,10 @@ class Network(nn.Module):
             elif layer_type=='unflatten':
                 self.layers[i]= nn.Unflatten(1, (h[i][1], h[i][2], h[i][2]))
                 
-        print(self.layers.keys())    
+            elif layer_type=='relu':
+                self.layers[i] = nn.ReLU()
+                
+        #print(self.layers.keys())    
                         
     def forward(self, x_b, debug=False):
 
@@ -53,10 +56,8 @@ class Network(nn.Module):
             
             if debug:
                 print(i, act.shape)
-
+                
             act = self.layers[i](act)
             
-            act = torch.tanh(act)
-
         return act
 
