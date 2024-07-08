@@ -15,6 +15,7 @@ import matplotlib.animation as animation
 from IPython.display import HTML
 from sklearn.decomposition import PCA
 import umap
+import matplotlib.cm as cm
 
 import nn_template 
 
@@ -48,7 +49,7 @@ class RandomCropDataset(Dataset):
         
         # Transformation pipeline without resizing
         transformation = transforms.Compose([
-            transforms.RandomRotation((rotation_degrees, rotation_degrees)),
+            transforms.RandomRotation((rotation_degrees, rotation_degrees), interpolation=transforms.InterpolationMode.BILINEAR),
             transforms.CenterCrop(N),  # Crop to NxN from the center
             transforms.ToTensor(),  # Convert to tensor
         ])
@@ -111,7 +112,7 @@ def generate_circles(number_of_circles, size_of_circles, radius=0):
     x_centers_flat = x_centers.reshape(-1, 1, 1)
     y_centers_flat = y_centers.reshape(-1, 1, 1)
     
-    # Calculate the squared distance from each Gaussian center to each point in the MxM grid
+    # Calculate the squared distance from each circle center to each point in the MxM grid
     dist_squared = (x_circle - x_centers_flat) ** 2 + (y_circle - y_centers_flat) ** 2
     dist = torch.sqrt(dist_squared)
     
@@ -131,14 +132,14 @@ def generate_circles(number_of_circles, size_of_circles, radius=0):
 
 def get_detectors(gabor_size, discreteness, device='cuda'):
     orientations = torch.linspace(0, np.pi, discreteness, device=device)
-    lambd = 12.0
-    sigma = 4.0
+    lambd = gabor_size
+    sigma = gabor_size/5
     gamma = 1
     psi = torch.tensor([0, np.pi/2], device=device)
 
     # Create a meshgrid for Gabor function
-    x, y = torch.meshgrid(torch.linspace(-gabor_size//2 + 1, gabor_size//2 + 1, gabor_size, device=device), 
-                          torch.linspace(-gabor_size//2 + 1, gabor_size//2 + 1, gabor_size, device=device), indexing='ij')
+    x, y = torch.meshgrid(torch.linspace(-gabor_size//2 + 1/2, gabor_size//2 + 1/2, gabor_size, device=device), 
+                          torch.linspace(-gabor_size//2 + 1/2, gabor_size//2 + 1/2, gabor_size, device=device), indexing='ij')
 
     x = x.expand(discreteness, 2, gabor_size, gabor_size)
     y = y.expand(discreteness, 2, gabor_size, gabor_size)
@@ -148,11 +149,15 @@ def get_detectors(gabor_size, discreteness, device='cuda'):
     x_theta = x * torch.cos(orientations) + y * torch.sin(orientations)
     y_theta = -x * torch.sin(orientations) + y * torch.cos(orientations)
     
-    gb = torch.exp(-.5 * (x_theta**2 + gamma**2 * y_theta**2) / sigma**2) * torch.cos(2 * np.pi * x_theta / lambd + psi)
+    gb = torch.cos(2 * np.pi * x_theta / lambd + psi) #* torch.exp(-.5 * (x_theta**2 + gamma**2 * y_theta**2) / sigma**2)
+    
+    gb = gb * get_circle(gabor_size, gabor_size/2, smooth=True).cuda()
+    
+    gb -= gb.mean([-1,-2], keepdim=True)
     
     return gb  # (discreteness, 2, gabor_size, gabor_size)
 
-def get_orientations(weights, discreteness=31, gabor_size=25):
+def get_orientations(weights, discreteness=101, gabor_size=25):
     
     device = weights.device
 
@@ -418,12 +423,25 @@ def get_doughnut(size, r, std):
     return doughnut
 
 # Function to get a circle mask with ones inside and zeros outside
-def get_circle(size, r):
+def get_circle(size, radius, smooth=True):
     
     distance = torch.arange(size) - size//2
     x = distance.expand(1,1,size,size)**2
     y = x.transpose(-1,-2)
-    circle = (x + y) < r**2
+    circle = torch.sqrt(x + y)
+    
+    # Calculate circle membership with smoothing
+    # Define the radius band for smooth transition (0.5 pixel width)
+    radius_inner = radius - 0.5
+    radius_outer = radius + 0.5
+
+    if smooth:
+        # Compute a smooth transition in pixel values across the boundary of the circle
+        circle = 1 - torch.clamp((circle - radius_inner) / (radius_outer - radius_inner), 0, 1)
+        
+    else:
+        circle = circle < radius
+    
     return circle
 
 
@@ -437,12 +455,12 @@ def get_effective_dims(code_tracker, debug=False):
     fft1 = torch.fft.fft2(codes_var) - torch.fft.fft2(TF.rotate(codes_var, 5))
     fft1 = torch.fft.fftshift(fft1)
     #fft1 *= ~get_circle(code_size, 1).cuda()
-    #fft1 *= get_circle(code_size, (0.5*code_size+0.5)).cuda()
+    fft1 *= get_circle(code_size, (code_size/2)).cuda()
 
     meanfft = (fft1.abs()**2).mean([0,1]).cpu()
     meanfft /= meanfft.sum()
     sorted_power = torch.argsort(meanfft.view(-1), dim=0, descending=True)
-    ordered = (meanfft.view(-1)[sorted_power]).cumsum(dim=0) < .7
+    ordered = (meanfft.view(-1)[sorted_power]).cumsum(dim=0) < .75
     cutoff = ordered.sum()
     
     plotfft = meanfft.view(-1)
@@ -461,7 +479,7 @@ def get_effective_dims(code_tracker, debug=False):
         reco = torch.relu(torch.fft.ifft2(fft1).float())
         plt.imshow(codes_var[0,0].cpu())
         plt.show()
-        plt.imshow(plotfft)
+        plt.imshow(plotfft, cmap=cm.Greys_r)
         plt.show()
         plt.imshow(reco[0,0].cpu())
         plt.show()
@@ -511,10 +529,11 @@ def get_pca_dimensions(code_tracker, n_samps):
 
 def get_umap(code_tracker, window_size):
     
-    codes_var = torch.cat(code_tracker, dim=0).cpu()
-    sorting_idx = codes_var.sum([1,2,3]).sort(descending=True)[1]
-    codes_var = codes_var[sorting_idx][1000:2000]    
-    codes_var = F.unfold(codes_var, window_size, stride=window_size).permute(0,2,1).reshape(-1, window_size**2)
+    codes_var = torch.cat(code_tracker, dim=0).cpu()   
+    codes_var = F.unfold(codes_var, window_size, stride=window_size).permute(0,2,1).reshape(-1, 1, window_size, window_size)
+    #sorting_idx = codes_var.sum([1,2,3]).sort(descending=True)[1]
+    #codes_var = codes_var[sorting_idx][:2000]
+    codes_var = codes_var.reshape(-1, window_size**2)
         
     size = codes_var.shape[-1]
     
@@ -537,12 +556,16 @@ def get_umap(code_tracker, window_size):
     
 
 # function to plot the umap
-def draw_umap(embedding, size, title='3D projection'):
+def draw_umap(embedding, size, dims=3, title='3D projection'):
     plt.ioff()
     plt.title(title, fontsize=18)
     fig = plt.figure(figsize=(size, size))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.scatter(embedding[:,0], embedding[:,1], embedding[:,2], s=10)
+    if dims==3:
+        ax = fig.add_subplot(111, projection='3d')
+        ax.scatter(embedding[:,0], embedding[:,1], embedding[:,2], s=10)
+    else:
+        ax = fig.add_subplot(111)
+        ax.scatter(embedding[:,0], embedding[:,1], s=10)
     plt.show()
     return fig, ax
 
@@ -550,12 +573,12 @@ def draw_umap(embedding, size, title='3D projection'):
 def select_grid_modules(code_tracker, window_size):
     
     codes_var = torch.cat(code_tracker, dim=0).cpu()
-    sorting_idx = codes_var.sum([1,2,3]).sort(descending=True)[1]
-    codes_var = codes_var[sorting_idx][2000:3000]    
+    #sorting_idx = codes_var.sum([1,2,3]).sort(descending=True)[1]
+    #codes_var = codes_var[sorting_idx][2000:3000]    
     codes_var = F.unfold(codes_var, window_size, stride=window_size)
     codes_var = codes_var.permute(0,2,1).reshape(-1, 1, window_size, window_size)
     
-    autocorrelograms = F.conv2d(codes_var, codes_var, padding=codes_var.shape[-1]//2).view(-1, window_size**2)
+    autocorrelograms = compute_autocorrelograms(codes_var, 3, 0.7, 0)
     
     embedding = umap.UMAP(
                 n_neighbors=5,
@@ -563,9 +586,93 @@ def select_grid_modules(code_tracker, window_size):
                 metric='manhattan',
                 n_components=2,
                 init='spectral'
-             ).fit_transform(autocorrelograms)
+             ).fit_transform(autocorrelograms.view(-1, window_size**2))
     
-    return embedding
+    return embedding, autocorrelograms
+
+
+def get_gratings(size, orientation, period, phase):
+    """
+    Generates a sinusoidal grating.
+    
+    Arguments:
+    size : int - The size of the grating image (height and width).
+    orientation : float - The orientation of the grating in degrees.
+    period : int - The spatial period of the grating, in pixels.
+    phase : float - The phase shift of the sinusoidal pattern, in degrees.
+    
+    Returns:
+    torch.Tensor - A 2D tensor representing the grating pattern.
+    """
+    # Convert orientation and phase from degrees to radians
+    orientation = torch.deg2rad(torch.tensor(orientation))
+    phase = torch.deg2rad(torch.tensor(phase))
+    
+    # Create a grid of coordinates
+    y, x = torch.meshgrid(torch.arange(size), torch.arange(size), indexing='ij')
+    
+    # Adjust the coordinates based on the center of the image
+    x = x - size // 2
+    y = y - size // 2
+    
+    # Rotate the coordinate system by the orientation
+    x_rot = x * torch.cos(orientation) + y * torch.sin(orientation)
+    y_rot = -x * torch.sin(orientation) + y * torch.cos(orientation)
+    
+    # Apply the sinusoidal function
+    grating = torch.sin(2 * torch.pi * x_rot / period + phase)
+    
+    return grating
+
+
+def compute_autocorrelograms(tiles, r, sigma, eps):
+    """
+    Computes spatial autocorrelograms for a batch of tiles, applies a mask around the peak,
+    smooths the result with a Gaussian filter, and thresholds the autocorrelogram.
+
+    Parameters:
+    tiles (torch.Tensor): Input tensor of shape (N, 1, W, W)
+    r (int): Radius for masking around the peak
+    sigma (float): Standard deviation for Gaussian smoothing
+    eps (float): Threshold for final autocorrelogram
+
+    Returns:
+    torch.Tensor: Processed autocorrelograms of shape (N, 1, W, W)
+    """
+    N, C, W, _ = tiles.shape
+    gauss = get_gaussian(oddenise(sigma*6), sigma)
+
+    # Step 1: Compute autocorrelograms
+    # Need to convert each tile to a full batch where each tile is a kernel
+    result = torch.empty((N, C, W, W))
+    for i in range(N):
+        # Applying convolution for each tile with itself
+        result[i] = F.conv2d(tiles[i].unsqueeze(0), tiles[i].unsqueeze(0), padding=W//2)
+
+    # Normalize the autocorrelograms (optional but typical)
+    result /= result.view(N, -1).max(1, keepdim=True)[0].view(N, 1, 1, 1)
+
+    # Step 2: Locate the peaks
+    # Assume peak is at the center for autocorrelation (common assumption, but you might need to adjust)
+    peak_coords = (W//2, W//2)
+
+    # Step 3: Mask out pixels within a radius 'r' from the peak
+    for i in range(N):
+        y, x = torch.meshgrid(torch.arange(W), torch.arange(W), indexing='ij')
+        mask = ((x - peak_coords[1])**2 + (y - peak_coords[0])**2) <= r**2
+        result[i, 0, mask] = 0
+        mask = ((x - peak_coords[1])**2 + (y - peak_coords[0])**2) >= (W/2)**2
+        result[i, 0, mask] = 0
+
+    # Step 4: Apply Gaussian smoothing
+    if sigma > 0:
+        for i in range(N):
+            result[i] = F.conv2d(result[i], gauss, padding=gauss.shape[-1]//2)
+
+    # Step 5: Threshold the autocorrelograms
+    result = torch.where(result >= eps, result, torch.zeros_like(result))
+
+    return result
     
     
 
